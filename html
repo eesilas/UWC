@@ -1,0 +1,1712 @@
+from flask import Flask, Response, request, send_file, jsonify
+import cv2
+import json
+import time
+import os
+import threading
+import logging
+import subprocess
+import re
+import lgpio
+import sys
+
+app = Flask(__name__)
+
+# 配置日志
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# 全局摄像头对象
+camera = None
+camera_lock = threading.Lock()
+
+# 全局GPIO对象
+GPIO_PIN = 18  # GPIO18/Pin12
+FREQUENCY = 50  # 50Hz
+PERIOD_MS = 1000 / FREQUENCY  # 20ms
+NEUTRAL_PULSE = 0.0015  # 1500μs (停止)
+FULL_CW_PULSE = 0.002   # 2000μs (全速CW)
+h = None
+gpio_lock = threading.Lock()
+motor_state = {'running': False, 'pulse_width': NEUTRAL_PULSE}
+
+# 当前摄像头设置
+current_settings = {
+    'resolution': '1280x480',
+    'fps': 30,
+    'brightness': 50,
+    'contrast': 50,
+    'saturation': 50,
+    'flip_h': True,
+    'flip_v': True,
+    'recording': False,
+    'format': 'mp4'
+}
+
+# 录像变量
+recording = False
+output_file = None
+frame_count = 0
+recording_start_time = 0
+recordings_folder = os.path.abspath('recordings')
+
+# 创建录像文件夹
+if not os.path.exists(recordings_folder):
+    try:
+        os.makedirs(recordings_folder)
+    except PermissionError:
+        logger.error("无法创建录像文件夹：权限不足")
+        raise Exception("无法创建录像文件夹：权限不足")
+
+# 初始化GPIO
+def initialize_gpio():
+    global h
+    try:
+        h = lgpio.gpiochip_open(0)
+        lgpio.gpio_claim_output(h, GPIO_PIN)
+        logger.info("GPIO初始化成功")
+        set_pwm(0)  # 初始化为停止状态
+    except Exception as e:
+        logger.error(f"GPIO初始化错误：{e}")
+        raise Exception(f"GPIO初始化错误：{e}")
+
+def set_pwm(state, pulse_width=NEUTRAL_PULSE):
+    """控制电机状态和速度"""
+    try:
+        with gpio_lock:
+            if state == 0:
+                pulse_width = NEUTRAL_PULSE
+            for _ in range(100):  # 2秒循环
+                lgpio.gpio_write(h, GPIO_PIN, 1)
+                time.sleep(pulse_width)
+                lgpio.gpio_write(h, GPIO_PIN, 0)
+                time.sleep(PERIOD_MS / 1000 - pulse_width)
+        motor_state['running'] = state != 0
+        motor_state['pulse_width'] = pulse_width
+        logger.info(f"电机{'运行' if state != 0 else '停止'}，脉宽：{pulse_width*1000000:.0f}μs")
+    except Exception as e:
+        logger.error(f"设置PWM错误：{e}")
+        raise Exception(f"设置PWM错误：{e}")
+
+def get_supported_resolutions(device_index=0):
+    """获取 USB 摄像头支持的分辨率"""
+    try:
+        result = subprocess.run(['v4l2-ctl', '--device', f'/dev/video{device_index}', '--list-formats-ext'],
+                                capture_output=True, text=True)
+        output = result.stdout
+        resolutions = []
+        pattern = r'Size: Discrete (\d+x\d+)'
+        for match in re.finditer(pattern, output):
+            resolutions.append(match.group(1))
+        return list(set(resolutions))
+    except Exception as e:
+        logger.warning(f"v4l2-ctl 失败，尝试 OpenCV 测试: {str(e)}")
+        camera = cv2.VideoCapture(device_index, cv2.CAP_V4L2)
+        if not camera.isOpened():
+            return []
+        test_resolutions = [(320, 240), (640, 480), (1280, 720), (1920, 1080)]
+        supported = []
+        for width, height in test_resolutions:
+            camera.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+            camera.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            actual_width = int(camera.get(cv2.CAP_PROP_FRAME_WIDTH))
+            actual_height = int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            if actual_width == width and actual_height == height:
+                supported.append(f"{width}x{height}")
+        camera.release()
+        return supported
+
+def parse_resolution(resolution_str):
+    """解析分辨率字符串为宽度和高度"""
+    try:
+        width, height = map(int, resolution_str.split('x'))
+        return width, height
+    except:
+        return 640, 480
+
+def initialize_camera():
+    """初始化或重新初始化摄像头"""
+    global camera
+    with camera_lock:
+        if camera is not None:
+            camera.release()
+            time.sleep(0.1)
+        camera = cv2.VideoCapture(0, cv2.CAP_V4L2)
+        if not camera.isOpened():
+            logger.error("无法打开摄像头")
+            raise Exception("无法打开摄像头")
+        
+        width, height = parse_resolution(current_settings['resolution'])
+        camera.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        camera.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        camera.set(cv2.CAP_PROP_FPS, current_settings['fps'])
+        camera.set(cv2.CAP_PROP_BRIGHTNESS, current_settings['brightness'] / 100)
+        camera.set(cv2.CAP_PROP_CONTRAST, current_settings['contrast'] / 100)
+        camera.set(cv2.CAP_PROP_SATURATION, current_settings['saturation'] / 100)
+        
+        actual_width = int(camera.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_height = int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if abs(actual_width - width) > 1 or abs(actual_height - height) > 1:
+            logger.warning(f"分辨率 {width}x{height} 设置失败，实际为 {actual_width}x{actual_height}")
+            return False
+        return True
+
+def generate_frames():
+    """生成视频帧并应用设置"""
+    global camera, recording, output_file, frame_count, recording_start_time
+    
+    while True:
+        with camera_lock:
+            if camera is None or not camera.isOpened():
+                try:
+                    initialize_camera()
+                except Exception as e:
+                    logger.error(f"摄像头初始化失败: {str(e)}")
+                    time.sleep(1)
+                    continue
+            
+            success, frame = camera.read()
+            if not success:
+                logger.warning("无法读取帧，尝试重新初始化摄像头")
+                try:
+                    initialize_camera()
+                except:
+                    time.sleep(1)
+                continue
+            
+            if current_settings['flip_h']:
+                frame = cv2.flip(frame, 1)
+            if current_settings['flip_v']:
+                frame = cv2.flip(frame, 0)
+            
+            if recording and output_file is not None:
+                output_file.write(frame)
+                frame_count += 1
+                elapsed_time = time.time() - recording_start_time
+                minutes = int(elapsed_time // 60)
+                seconds = int(elapsed_time % 60)
+                rec_text = f"REC {minutes:02d}:{seconds:02d}"
+                cv2.putText(frame, rec_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+                            1, (0, 0, 255), 2, cv2.LINE_AA)
+                cv2.circle(frame, (25, 55), 10, (0, 0, 255), -1)
+            
+            ret, buffer = cv2.imencode('.jpg', frame)
+            if not ret:
+                continue
+            frame_bytes = buffer.tobytes()
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+        
+        time.sleep(1.0 / current_settings['fps'])
+
+@app.route('/video_feed')
+def video_feed():
+    """提供视频流"""
+    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/update_settings', methods=['POST'])
+def update_settings():
+    """更新摄像头设置"""
+    global current_settings, camera, recording, output_file
+    data = request.get_json()
+    
+    supported_resolutions = get_supported_resolutions()
+    
+    if 'resolution' in data and data['resolution'] in supported_resolutions:
+        if current_settings['resolution'] != data['resolution']:
+            if recording:
+                recording = False
+                if output_file is not None:
+                    output_file.release()
+                    output_file = None
+            current_settings['resolution'] = data['resolution']
+            try:
+                success = initialize_camera()
+                if not success:
+                    current_settings['resolution'] = '640x480'
+                    initialize_camera()
+                    return jsonify({'status': 'error', 'message': '分辨率不支持，回退到 640x480'})
+            except Exception as e:
+                logger.error(f"分辨率切换失败: {str(e)}")
+                current_settings['resolution'] = '640x480'
+                initialize_camera()
+                return jsonify({'status': 'error', 'message': f'分辨率切换失败: {str(e)}'})
+    
+    if 'fps' in data and int(data['fps']) in [15, 30, 60]:
+        current_settings['fps'] = int(data['fps'])
+        with camera_lock:
+            if camera is not None:
+                camera.set(cv2.CAP_PROP_FPS, current_settings['fps'])
+    
+    if 'brightness' in data:
+        current_settings['brightness'] = max(0, min(100, int(data['brightness'])))
+        with camera_lock:
+            if camera is not None:
+                camera.set(cv2.CAP_PROP_BRIGHTNESS, current_settings['brightness'] / 100)
+    
+    if 'contrast' in data:
+        current_settings['contrast'] = max(0, min(100, int(data['contrast'])))
+        with camera_lock:
+            if camera is not None:
+                camera.set(cv2.CAP_PROP_CONTRAST, current_settings['contrast'] / 100)
+    
+    if 'saturation' in data:
+        current_settings['saturation'] = max(99, min(100, int(data['saturation'])))
+        with camera_lock:
+            if camera is not None:
+                camera.set(cv2.CAP_PROP_SATURATION, current_settings['saturation'] / 1)
+    
+    if 'flip_h' in data:
+        current_settings['flip_h'] = data['flip_h']
+    if 'flip_v' in data:
+        current_settings['flip_v'] = data['flip_v']
+    
+    if 'format' in data and data['format'] in ['avi', 'mp4']:
+        current_settings['format'] = data['format']
+    
+    return jsonify({'status': 'success', 'settings': current_settings})
+
+@app.route('/toggle_recording', methods=['POST'])
+def toggle_recording():
+    """开始或停止录像"""
+    global recording, output_file, frame_count, recording_start_time, current_settings
+    
+    data = request.get_json()
+    action = data.get('action')
+    
+    if action == 'start' and not recording:
+        width, height = parse_resolution(current_settings['resolution'])
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        file_ext = current_settings['format']
+        file_path = os.path.join(recordings_folder, f'recording_{timestamp}.{file_ext}')
+        
+        if file_ext == 'mp4':
+            fourcc = cv2.VideoWriter_fourcc(*'H264')
+        else:
+            fourcc = cv2.VideoWriter_fourcc(*'XVID')
+        
+        try:
+            output_file = cv2.VideoWriter(file_path, fourcc, current_settings['fps'], (width, height))
+            if not output_file.isOpened():
+                logger.error("无法创建录像文件")
+                return jsonify({'status': 'error', 'message': '无法创建录像文件'})
+            recording = True
+            frame_count = 0
+            recording_start_time = time.time()
+            return jsonify({'status': 'success', 'message': '录像开始', 'recording': True})
+        except Exception as e:
+            logger.error(f"开始录像失败: {str(e)}")
+            return jsonify({'status': 'error', 'message': f'开始录像失败: {str(e)}'})
+    
+    elif action == 'stop' and recording:
+        recording = False
+        if output_file is not None:
+            output_file.release()
+            output_file = None
+        duration = time.time() - recording_start_time
+        return jsonify({
+            'status': 'success',
+            'message': f'录像停止，捕获 {frame_count} 帧，持续 {duration:.2f} 秒',
+            'recording': False
+        })
+    
+    return jsonify({'status': 'error', 'message': '无效请求'})
+
+@app.route('/control_motor', methods=['POST'])
+def control_motor():
+    """控制电机启动、停止和速度"""
+    global motor_state
+    data = request.get_json()
+    action = data.get('action')
+    speed = data.get('speed', 0)  # 速度百分比（0-100）
+    
+    if action not in ['start', 'stop']:
+        return jsonify({'status': 'error', 'message': '无效动作'})
+    
+    try:
+        if action == 'start':
+            # 将速度百分比映射到脉宽（1500μs到2000μs）
+            pulse_width = NEUTRAL_PULSE + (FULL_CW_PULSE - NEUTRAL_PULSE) * (speed / 100)
+            set_pwm(1, pulse_width)
+            return jsonify({'status': 'success', 'message': f'电机启动，速度 {speed}%'})
+        else:
+            set_pwm(0)
+            return jsonify({'status': 'success', 'message': '电机停止'})
+    except Exception as e:
+        logger.error(f"电机控制失败: {str(e)}")
+        return jsonify({'status': 'error', 'message': f'电机控制失败: {str(e)}'})
+
+@app.route('/get_motor_status', methods=['GET'])
+def get_motor_status():
+    """返回当前电机状态"""
+    speed_percent = (motor_state['pulse_width'] - NEUTRAL_PULSE) / (FULL_CW_PULSE - NEUTRAL_PULSE) * 100
+    return jsonify({
+        'running': motor_state['running'],
+        'speed': round(speed_percent, 2)
+    })
+
+@app.route('/get_recordings', methods=['GET'])
+def get_recordings():
+    """获取录像文件列表"""
+    recordings = []
+    for file in os.listdir(recordings_folder):
+        if file.endswith(('.avi', '.mp4')):
+            file_path = os.path.join(recordings_folder, file)
+            file_stats = os.stat(file_path)
+            recordings.append({
+                'name': file,
+                'size': file_stats.st_size,
+                'date': time.ctime(file_stats.st_ctime)
+            })
+    return jsonify({'recordings': recordings})
+
+@app.route('/download_recording/<filename>', methods=['GET'])
+def download_recording(filename):
+    """下载录像文件"""
+    file_path = os.path.join(recordings_folder, filename)
+    if os.path.exists(file_path) and (filename.endswith('.avi') or filename.endswith('.mp4')):
+        return send_file(file_path, as_attachment=True)
+    return jsonify({'status': 'error', 'message': '文件不存在或格式不支持'}), 404
+
+@app.route('/delete_recording/<filename>', methods=['POST'])
+def delete_recording(filename):
+    """删除录像文件"""
+    file_path = os.path.join(recordings_folder, filename)
+    if os.path.exists(file_path) and (filename.endswith('.avi') or filename.endswith('.mp4')):
+        try:
+            os.remove(file_path)
+            return jsonify({'status': 'success', 'message': '文件已删除'})
+        except Exception as e:
+            logger.error(f"删除文件失败: {str(e)}")
+            return jsonify({'status': 'error', 'message': f'删除文件失败: {str(e)}'})
+    return jsonify({'status': 'error', 'message': '文件不存在或格式不支持'}), 404
+
+@app.route('/get_supported_resolutions', methods=['GET'])
+def get_supported_resolutions_route():
+    """返回摄像头支持的分辨率"""
+    resolutions = get_supported_resolutions()
+    if not resolutions:
+        resolutions = ['640x480']
+    return jsonify({'resolutions': resolutions})
+
+@app.route('/get_current_settings', methods=['GET'])
+def get_current_settings():
+    """返回当前摄像头设置"""
+    return jsonify(current_settings)
+
+@app.route('/')
+def index():
+    """提供主页面"""
+    return """
+    <!DOCTYPE html>
+    <html lang="zh-CN">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>USB 摄像头与电机控制面板</title>
+        <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
+        <style>
+            :root {
+                --primary-color: #2196F3;
+                --secondary-color: #03A9F4;
+                --accent-color: #FF4081;
+                --dark-color: #263238;
+                --light-color: #ECEFF1;
+                --success-color: #4CAF50;
+                --warning-color: #FFC107;
+                --danger-color: #F44336;
+                --bg-gradient: linear-gradient(135deg, #42A5F5 0%, #2196F3 100%);
+            }
+            
+            * {
+                box-sizing: border-box;
+                margin: 0;
+                padding: 0;
+            }
+            
+            body {
+                font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                line-height: 1.6;
+                color: #333;
+                background-color: #f5f5f5;
+                margin: 0;
+                padding: 0;
+            }
+            
+            .container {
+                display: grid;
+                grid-template-columns: 320px 1fr;
+                min-height: 100vh;
+            }
+            
+            .sidebar {
+                background-color: var(--dark-color);
+                color: white;
+                padding: 20px;
+                box-shadow: 2px 0 5px rgba(0,0,0,0.1);
+                overflow-y: auto;
+                position: relative;
+                z-index: 10;
+                transition: transform 0.3s ease;
+            }
+            
+            .logo {
+                display: flex;
+                align-items: center;
+                margin-bottom: 30px;
+                padding-bottom: 15px;
+                border-bottom: 1px solid rgba(255,255,255,0.1);
+            }
+            
+            .logo i {
+                font-size: 24px;
+                margin-right: 10px;
+                color: var(--primary-color);
+            }
+            
+            .logo h1 {
+                font-size: 1.5rem;
+                font-weight: 600;
+            }
+            
+            .sidebar h2 {
+                font-size: 1.2rem;
+                margin: 20px 0 15px;
+                color: var(--light-color);
+                display: flex;
+                align-items: center;
+            }
+            
+            .sidebar h2 i {
+                margin-right: 10px;
+                color: var(--primary-color);
+            }
+            
+            .control-group {
+                margin-bottom: 20px;
+                background: rgba(255,255,255,0.05);
+                border-radius: 8px;
+                padding: 15px;
+            }
+            
+            .control-item {
+                margin-bottom: 15px;
+            }
+            
+            .control-item:last-child {
+                margin-bottom: 0;
+            }
+            
+            label {
+                display: block;
+                margin-bottom: 8px;
+                font-weight: 500;
+                color: var(--light-color);
+            }
+            
+            select, 
+            input[type="range"] {
+                width: 100%;
+                padding: 8px 12px;
+                border-radius: 4px;
+                border: 1px solid rgba(255,255,255,0.1);
+                background-color: rgba(255,255,255,0.05);
+                color: white;
+                font-size: 14px;
+                transition: all 0.3s;
+            }
+            
+            select {
+                appearance: none;
+                background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='white' d='M6 9L1 4h10z'/%3E%3C/svg%3E");
+                background-repeat: no-repeat;
+                background-position: right 10px center;
+                padding-right: 30px;
+            }
+            
+            select:focus, 
+            input[type="range"]:focus {
+                outline: none;
+                border-color: var(--primary-color);
+                box-shadow: 0 0 0 2px rgba(33, 150, 243, 0.3);
+            }
+            
+            .slider-container {
+                position: relative;
+            }
+            
+            input[type="range"] {
+                -webkit-appearance: none;
+                height: 8px;
+                background: rgba(255,255,255,0.1);
+                border-radius: 4px;
+                outline: none;
+                padding: 0;
+            }
+            
+            input[type="range"]::-webkit-slider-thumb {
+                -webkit-appearance: none;
+                width: 18px;
+                height: 18px;
+                border-radius: 50%;
+                background: var(--primary-color);
+                cursor: pointer;
+                border: none;
+                box-shadow: 0 0 5px rgba(0,0,0,0.2);
+            }
+            
+            .value-display {
+                position: absolute;
+                right: 0;
+                top: -25px;
+                background: var(--primary-color);
+                color: white;
+                padding: 2px 8px;
+                border-radius: 4px;
+                font-size: 12px;
+                transform: translateX(50%);
+                opacity: 0;
+                transition: opacity 0.3s;
+                pointer-events: none;
+            }
+            
+            input[type="range"]:hover + .value-display,
+            input[type="range"]:focus + .value-display {
+                opacity: 1;
+            }
+            
+            .switch-container {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+            }
+            
+            .switch {
+                position: relative;
+                display: inline-block;
+                width: 44px;
+                height: 22px;
+            }
+            
+            .switch input {
+                opacity: 0;
+                width: 0;
+                height: 0;
+            }
+            
+            .slider {
+                position: absolute;
+                cursor: pointer;
+                top: 0;
+                left: 0;
+                right: 0;
+                bottom: 0;
+                background-color: rgba(255,255,255,0.1);
+                transition: .4s;
+                border-radius: 22px;
+            }
+            
+            .slider:before {
+                position: absolute;
+                content: "";
+                height: 16px;
+                width: 16px;
+                left: 3px;
+                bottom: 3px;
+                background-color: white;
+                transition: .4s;
+                border-radius: 50%;
+            }
+            
+            input:checked + .slider {
+                background-color: var(--primary-color);
+            }
+            
+            input:focus + .slider {
+                box-shadow: 0 0 1px var(--primary-color);
+            }
+            
+            input:checked + .slider:before {
+                transform: translateX(22px);
+            }
+            
+            .action-buttons {
+                display: flex;
+                flex-direction: column;
+                gap: 10px;
+                margin-top: 25px;
+            }
+            
+            .btn {
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                padding: 10px 16px;
+                border: none;
+                border-radius: 4px;
+                font-size: 14px;
+                font-weight: 500;
+                cursor: pointer;
+                transition: all 0.3s;
+                box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+            }
+            
+            .btn i {
+                margin-right: 8px;
+                font-size: 16px;
+            }
+            
+            .btn-primary {
+                background-color: var(--primary-color);
+                color: white;
+            }
+            
+            .btn-primary:hover {
+                background-color: #1976D2;
+            }
+            
+            .btn-success {
+                background-color: var(--success-color);
+                color: white;
+            }
+            
+            .btn-success:hover {
+                background-color: #388E3C;
+            }
+            
+            .btn-danger {
+                background-color: var(--danger-color);
+                color: white;
+                display: none;
+            }
+            
+            .btn-danger:hover {
+                background-color: #D32F2F;
+            }
+            
+            .btn-secondary {
+                background-color: rgba(255,255,255,0.1);
+                color: white;
+            }
+            
+            .btn-secondary:hover {
+                background-color: rgba(255,255,255,0.2);
+            }
+            
+            .main-content {
+                padding: 20px;
+                overflow-y: auto;
+                background-color: #f5f5f5;
+                display: flex;
+                flex-direction: column;
+            }
+            
+            .video-container {
+                position: relative;
+                width: 100%;
+                background-color: #000;
+                border-radius: 8px;
+                overflow: hidden;
+                box-shadow: 0 4px 15px rgba(0,0,0,0.1);
+                aspect-ratio: 16/9;
+                max-height: 80vh;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            }
+            
+            .video-feed {
+                max-width: 100%;
+                max-height: 100%;
+                display: block;
+            }
+            
+            .overlay-controls {
+                position: absolute;
+                bottom: 0;
+                left: 0;
+                right: 0;
+                padding: 15px;
+                background: linear-gradient(to top, rgba(0,0,0,0.7), transparent);
+                display: flex;
+                justify-content: center;
+                opacity: 0;
+                transition: opacity 0.3s;
+            }
+            
+            .video-container:hover .overlay-controls {
+                opacity: 1;
+            }
+            
+            .overlay-btn {
+                background-color: rgba(255,255,255,0.15);
+                color: white;
+                border: none;
+                border-radius: 50%;
+                width: 40px;
+                height: 40px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                margin: 0 8px;
+                cursor: pointer;
+                transition: all 0.3s;
+            }
+            
+            .overlay-btn:hover {
+                background-color: rgba(255,255,255,0.25);
+            }
+            
+            .overlay-btn i {
+                font-size: 18px;
+            }
+            
+            .snapshot-btn {
+                background-color: var(--primary-color);
+            }
+            
+            .snapshot-btn:hover {
+                background-color: #1976D2;
+            }
+            
+            .recording-indicator {
+                position: absolute;
+                top: 15px;
+                left: 15px;
+                display: flex;
+                align-items: center;
+                background-color: rgba(0,0,0,0.5);
+                color: white;
+                padding: 5px 10px;
+                border-radius: 4px;
+                font-size: 14px;
+                opacity: 0;
+                transition: opacity 0.3s;
+            }
+            
+            .recording-indicator.active {
+                opacity: 1;
+            }
+            
+            .recording-indicator .dot {
+                width: 12px;
+                height: 12px;
+                background-color: #F44336;
+                border-radius: 50%;
+                margin-right: 8px;
+                animation: blink 1s infinite;
+            }
+            
+            .motor-status {
+                position: absolute;
+                top: 50px;
+                left: 15px;
+                display: flex;
+                align-items: center;
+                background-color: rgba(0,0,0,0.5);
+                color: white;
+                padding: 5px 10px;
+                border-radius: 4px;
+                font-size: 14px;
+                transition: opacity 0.3s;
+            }
+            
+            @keyframes blink {
+                0% { opacity: 1; }
+                50% { opacity: 0.3; }
+                100% { opacity: 1; }
+            }
+            
+            .recordings-list {
+                margin-top: 30px;
+                background-color: white;
+                border-radius: 8px;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.05);
+                overflow: hidden;
+                display: none;
+            }
+            
+            .recordings-header {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                padding: 15px 20px;
+                border-bottom: 1px solid #eee;
+            }
+            
+            .recordings-header h2 {
+                font-size: 1.2rem;
+                color: var(--dark-color);
+                margin: 0;
+            }
+            
+            .recordings-content {
+                max-height: 300px;
+                overflow-y: auto;
+            }
+            
+            .recording-item {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                padding: 12px 20px;
+                border-bottom: 1px solid #f0f0f0;
+                transition: background-color 0.3s;
+            }
+            
+            .recording-item:hover {
+                background-color: #f9f9f9;
+            }
+            
+            .recording-item:last-child {
+                border-bottom: none;
+            }
+            
+            .recording-info {
+                flex: 1;
+            }
+            
+            .recording-name {
+                font-weight: 500;
+                margin-bottom: 5px;
+            }
+            
+            .recording-meta {
+                font-size: 12px;
+                color: #757575;
+                display: flex;
+                gap: 15px;
+            }
+            
+            .recording-actions {
+                display: flex;
+                gap: 10px;
+            }
+            
+            .recording-btn {
+                background: none;
+                border: none;
+                font-size: 16px;
+                cursor: pointer;
+                color: #757575;
+                transition: color 0.3s;
+            }
+            
+            .recording-btn:hover {
+                color: var(--primary-color);
+            }
+            
+            .download-btn:hover {
+                color: var(--success-color);
+            }
+            
+            .delete-btn:hover {
+                color: var(--danger-color);
+            }
+            
+            .notification {
+                position: fixed;
+                bottom: 20px;
+                right: 20px;
+                padding: 15px 20px;
+                background-color: var(--dark-color);
+                color: white;
+                border-radius: 4px;
+                box-shadow: 0 3px 10px rgba(0,0,0,0.2);
+                transform: translateY(100px);
+                opacity: 0;
+                transition: all 0.3s;
+                z-index: 1000;
+                max-width: 300px;
+            }
+            
+            .notification.show {
+                transform: translateY(0);
+                opacity: 1;
+            }
+            
+            .notification.success {
+                background-color: var(--success-color);
+            }
+            
+            .notification.error {
+                background-color: var(--danger-color);
+            }
+            
+            .notification-content {
+                display: flex;
+                align-items: center;
+            }
+            
+            .notification-icon {
+                margin-right: 12px;
+                font-size: 20px;
+            }
+            
+            .notification-message {
+                flex: 1;
+            }
+            
+            @media (max-width: 1024px) {
+                .container {
+                    grid-template-columns: 280px 1fr;
+                }
+            }
+            
+            @media (max-width: 768px) {
+                .container {
+                    grid-template-columns: 1fr;
+                }
+                
+                .sidebar {
+                    display: none;
+                    position: fixed;
+                    top: 0;
+                    left: 0;
+                    bottom: 0;
+                    width: 100%;
+                    max-width: 320px;
+                    z-index: 100;
+                    transform: translateX(-100%);
+                }
+                
+                .sidebar.show {
+                    display: block;
+                    transform: translateX(0);
+                }
+                
+                .menu-toggle {
+                    display: block;
+                    position: fixed;
+                    top: 20px;
+                    left: 20px;
+                    z-index: 101;
+                    background-color: var(--primary-color);
+                    color: white;
+                    width: 40px;
+                    height: 40px;
+                    border-radius: 50%;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    cursor: pointer;
+                    box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+                }
+            }
+            
+            @media (max-width: 480px) {
+                .sidebar {
+                    max-width: 100%;
+                }
+                
+                .recordings-header {
+                    flex-direction: column;
+                    align-items: flex-start;
+                }
+                
+                .recording-item {
+                    flex-direction: column;
+                    align-items: flex-start;
+                }
+                
+                .recording-actions {
+                    margin-top: 10px;
+                }
+            }
+            
+            @media (prefers-color-scheme: dark) {
+                body {
+                    background-color: #121212;
+                    color: #e0e0e0;
+                }
+                
+                .main-content {
+                    background-color: #121212;
+                }
+                
+                .recordings-list {
+                    background-color: #1e1e1e;
+                }
+                
+                .recording-item {
+                    border-bottom-color: #2c2c2c;
+                }
+                
+                .recording-item:hover {
+                    background-color: #252525;
+                }
+                
+                .recordings-header {
+                    border-bottom-color: #2c2c2c;
+                }
+                
+                .recordings-header h2 {
+                    color: #e0e0e0;
+                }
+                
+                .recording-meta {
+                    color: #9e9e9e;
+                }
+                
+                .recording-btn {
+                    color: #9e9e9e;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="sidebar">
+                <div class="logo">
+                    <i class="fas fa-video"></i>
+                    <h1>USB 摄像头与电机控制</h1>
+                </div>
+                
+                <h2><i class="fas fa-sliders-h"></i> 摄像头设置</h2>
+                
+                <div class="control-group">
+                    <div class="control-item">
+                        <label for="resolution">分辨率</label>
+                        <select id="resolution">
+                            <!-- 动态填充 -->
+                        </select>
+                    </div>
+                    
+                    <div class="control-item">
+                        <label for="fps">帧率 (FPS)</label>
+                        <select id="fps">
+                            <option value="15">15 FPS</option>
+                            <option value="30">30 FPS</option>
+                            <option value="60">60 FPS</option>
+                        </select>
+                    </div>
+                    
+                    <div class="control-item">
+                        <label for="format">录像格式</label>
+                        <select id="format">
+                            <option value="mp4">MP4 (H.264)</option>
+                            <option value="avi">AVI (XVID)</option>
+                        </select>
+                    </div>
+                </div>
+                
+                <h2><i class="fas fa-adjust"></i> 图像调整</h2>
+                
+                <div class="control-group">
+                    <div class="control-item">
+                        <label for="brightness">亮度</label>
+                        <div class="slider-container">
+                            <input type="range" id="brightness" min="0" max="100" value="50" class="image-control">
+                            <div class="value-display" id="brightness-value">50</div>
+                        </div>
+                    </div>
+                    
+                    <div class="control-item">
+                        <label for="contrast">对比度</label>
+                        <div class="slider-container">
+                            <input type="range" id="contrast" min="0" max="100" value="50" class="image-control">
+                            <div class="value-display" id="contrast-value">50</div>
+                        </div>
+                    </div>
+                    
+                    <div class="control-item">
+                        <label for="saturation">饱和度</label>
+                        <div class="slider-container">
+                            <input type="range" id="saturation" min="0" max="100" value="50" class="image-control">
+                            <div class="value-display" id="saturation-value">50</div>
+                        </div>
+                    </div>
+                </div>
+                
+                <h2><i class="fas fa-exchange-alt"></i> 图像方向</h2>
+                
+                <div class="control-group">
+                    <div class="control-item switch-container">
+                        <label for="flip_h">水平翻转</label>
+                        <label class="switch">
+                            <input type="checkbox" id="flip_h">
+                            <span class="slider"></span>
+                        </label>
+                    </div>
+                    
+                    <div class="control-item switch-container">
+                        <label for="flip_v">垂直翻转</label>
+                        <label class="switch">
+                            <input type="checkbox" id="flip_v">
+                            <span class="slider"></span>
+                        </label>
+                    </div>
+                </div>
+                
+                <h2><i class="fas fa-cog"></i> 电机控制</h2>
+                
+                <div class="control-group">
+                    <div class="control-item">
+                        <label for="motor_speed">电机速度 (%)</label>
+                        <div class="slider-container">
+                            <input type="range" id="motor_speed" min="0" max="100" value="50" class="motor-control">
+                            <div class="value-display" id="motor_speed_value">50</div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="action-buttons">
+                    <button id="start-recording" class="btn btn-success">
+                        <i class="fas fa-record-vinyl"></i> 开始录像
+                    </button>
+                    <button id="stop-recording" class="btn btn-danger">
+                        <i class="fas fa-stop-circle"></i> 停止录像
+                    </button>
+                    <button id="start-motor" class="btn btn-success">
+                        <i class="fas fa-play"></i> 启动电机
+                    </button>
+                    <button id="stop-motor" class="btn btn-danger">
+                        <i class="fas fa-stop"></i> 停止电机
+                    </button>
+                    <button id="show-recordings" class="btn btn-secondary">
+                        <i class="fas fa-film"></i> 查看录像
+                    </button>
+                </div>
+            </div>
+            
+            <div class="main-content">
+                <div class="video-container">
+                    <img src="/video_feed" alt="Camera Stream" class="video-feed">
+                    
+                    <div class="recording-indicator" id="recording-indicator">
+                        <div class="dot"></div>
+                        <span>REC 00:00</span>
+                    </div>
+                    
+                    <div class="motor-status" id="motor-status">
+                        <span>电机：停止</span>
+                    </div>
+                    
+                    <div class="overlay-controls">
+                        <button class="overlay-btn snapshot-btn" title="拍摄快照">
+                            <i class="fas fa-camera"></i>
+                        </button>
+                        <button class="overlay-btn fullscreen-btn" title="全屏">
+                            <i class="fas fa-expand"></i>
+                        </button>
+                    </div>
+                </div>
+                
+                <div class="recordings-list" id="recordings-list">
+                    <div class="recordings-header">
+                        <h2>录像文件</h2>
+                        <button class="btn btn-secondary" id="close-recordings">
+                            <i class="fas fa-times"></i> 关闭
+                        </button>
+                    </div>
+                    <div class="recordings-content" id="recordings-content">
+                    </div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="notification" id="notification">
+            <div class="notification-content">
+                <div class="notification-icon">
+                    <i class="fas fa-info-circle"></i>
+                </div>
+                <div class="notification-message">设置更新成功</div>
+            </div>
+        </div>
+        
+        <div class="menu-toggle" id="menu-toggle">
+            <i class="fas fa-bars"></i>
+        </div>
+        
+        <script>
+            const resolutionSelect = document.getElementById('resolution');
+            const fpsSelect = document.getElementById('fps');
+            const formatSelect = document.getElementById('format');
+            const brightnessSlider = document.getElementById('brightness');
+            const brightnessValue = document.getElementById('brightness-value');
+            const contrastSlider = document.getElementById('contrast');
+            const contrastValue = document.getElementById('contrast-value');
+            const saturationSlider = document.getElementById('saturation');
+            const saturationValue = document.getElementById('saturation-value');
+            const flipHToggle = document.getElementById('flip_h');
+            const flipVToggle = document.getElementById('flip_v');
+            const startRecordingBtn = document.getElementById('start-recording');
+            const stopRecordingBtn = document.getElementById('stop-recording');
+            const startMotorBtn = document.getElementById('start-motor');
+            const stopMotorBtn = document.getElementById('stop-motor');
+            const motorSpeedSlider = document.getElementById('motor_speed');
+            const motorSpeedValue = document.getElementById('motor_speed_value');
+            const motorStatus = document.getElementById('motor-status');
+            const showRecordingsBtn = document.getElementById('show-recordings');
+            const recordingsList = document.getElementById('recordings-list');
+            const recordingsContent = document.getElementById('recordings-content');
+            const closeRecordingsBtn = document.getElementById('close-recordings');
+            const recordingIndicator = document.getElementById('recording-indicator');
+            const notification = document.getElementById('notification');
+            const menuToggle = document.querySelector('.menu-toggle');
+            const sidebar = document.querySelector('.sidebar');
+            const snapshotBtn = document.querySelector('.snapshot-btn');
+            const fullscreenBtn = document.querySelector('.fullscreen-btn');
+            const videoFeed = document.querySelector('.video-feed');
+            const videoContainer = document.querySelector('.video-container');
+            
+            let isRecording = false;
+            let recordingTimer = null;
+            let recordingStartTime = 0;
+            let isMotorRunning = false;
+            
+            window.addEventListener('DOMContentLoaded', async () => {
+                await loadSupportedResolutions();
+                await loadSettings();
+                await loadMotorStatus();
+                
+                resolutionSelect.addEventListener('change', updateSettings);
+                fpsSelect.addEventListener('change', updateSettings);
+                formatSelect.addEventListener('change', updateSettings);
+                brightnessSlider.addEventListener('input', updateBrightnessValue);
+                brightnessSlider.addEventListener('change', updateSettings);
+                contrastSlider.addEventListener('input', updateContrastValue);
+                contrastSlider.addEventListener('change', updateSettings);
+                saturationSlider.addEventListener('input', updateSaturationValue);
+                saturationSlider.addEventListener('change', updateSettings);
+                flipHToggle.addEventListener('change', updateSettings);
+                flipVToggle.addEventListener('change', updateSettings);
+                startRecordingBtn.addEventListener('click', startRecording);
+                stopRecordingBtn.addEventListener('click', stopRecording);
+                startMotorBtn.addEventListener('click', startMotor);
+                stopMotorBtn.addEventListener('click', stopMotor);
+                motorSpeedSlider.addEventListener('input', updateMotorSpeedValue);
+                motorSpeedSlider.addEventListener('change', updateMotorSpeed);
+                showRecordingsBtn.addEventListener('click', toggleRecordingsList);
+                closeRecordingsBtn.addEventListener('click', toggleRecordingsList);
+                menuToggle.addEventListener('click', toggleSidebar);
+                snapshotBtn.addEventListener('click', takeSnapshot);
+                fullscreenBtn.addEventListener('click', toggleFullscreen);
+                
+                updateBrightnessValue();
+                updateContrastValue();
+                updateSaturationValue();
+                updateMotorSpeedValue();
+                
+                setInterval(loadMotorStatus, 5000); // 每5秒更新电机状态
+            });
+            
+            async function loadSupportedResolutions() {
+                try {
+                    const response = await fetch('/get_supported_resolutions');
+                    const data = await response.json();
+                    resolutionSelect.innerHTML = '';
+                    data.resolutions.forEach(res => {
+                        const option = document.createElement('option');
+                        option.value = res;
+                        option.textContent = res;
+                        resolutionSelect.appendChild(option);
+                    });
+                    resolutionSelect.value = data.resolutions.includes('640x480') ? '640x480' : data.resolutions[0];
+                } catch (error) {
+                    console.error('加载支持分辨率失败:', error);
+                    showNotification('无法加载支持分辨率', 'error');
+                }
+            }
+            
+            async function loadSettings() {
+                try {
+                    const response = await fetch('/get_current_settings');
+                    const settings = await response.json();
+                    resolutionSelect.value = settings.resolution;
+                    fpsSelect.value = settings.fps;
+                    formatSelect.value = settings.format;
+                    brightnessSlider.value = settings.brightness;
+                    contrastSlider.value = settings.contrast;
+                    saturationSlider.value = settings.saturation;
+                    flipHToggle.checked = settings.flip_h;
+                    flipVToggle.checked = settings.flip_v;
+                    
+                    updateBrightnessValue();
+                    updateContrastValue();
+                    updateSaturationValue();
+                } catch (error) {
+                    console.error('加载设置失败:', error);
+                    showNotification('无法加载摄像头设置', 'error');
+                }
+            }
+            
+            async function loadMotorStatus() {
+                try {
+                    const response = await fetch('/get_motor_status');
+                    const status = await response.json();
+                    isMotorRunning = status.running;
+                    motorSpeedSlider.value = status.speed;
+                    updateMotorSpeedValue();
+                    startMotorBtn.style.display = isMotorRunning ? 'none' : 'inline-flex';
+                    stopMotorBtn.style.display = isMotorRunning ? 'inline-flex' : 'none';
+                    motorStatus.textContent = isMotorRunning ? `电机：运行中（速度 ${status.speed.toFixed(0)}%）` : '电机：停止';
+                } catch (error) {
+                    console.error('加载电机状态失败:', error);
+                    showNotification('无法加载电机状态', 'error');
+                }
+            }
+            
+            function updateBrightnessValue() {
+                brightnessValue.textContent = brightnessSlider.value;
+            }
+            
+            function updateContrastValue() {
+                contrastValue.textContent = contrastSlider.value;
+            }
+            
+            function updateSaturationValue() {
+                saturationValue.textContent = saturationSlider.value;
+            }
+            
+            function updateMotorSpeedValue() {
+                motorSpeedValue.textContent = motorSpeedSlider.value;
+            }
+            
+            async function updateSettings() {
+                const settings = {
+                    resolution: resolutionSelect.value,
+                    fps: fpsSelect.value,
+                    format: formatSelect.value,
+                    brightness: brightnessSlider.value,
+                    contrast: contrastSlider.value,
+                    saturation: saturationSlider.value,
+                    flip_h: flipHToggle.checked,
+                    flip_v: flipVToggle.checked
+                };
+                
+                try {
+                    const response = await fetch('/update_settings', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(settings)
+                    });
+                    const data = await response.json();
+                    if (data.status === 'success') {
+                        showNotification('设置更新成功', 'success');
+                    } else {
+                        showNotification(data.message || '设置更新失败', 'error');
+                        if (data.message.includes('分辨率')) {
+                            resolutionSelect.value = data.settings.resolution;
+                        }
+                    }
+                } catch (error) {
+                    console.error('更新设置失败:', error);
+                    showNotification('设置更新失败', 'error');
+                }
+            }
+            
+            async function startRecording() {
+                try {
+                    const response = await fetch('/toggle_recording', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ action: 'start' })
+                    });
+                    const data = await response.json();
+                    if (data.status === 'success') {
+                        isRecording = true;
+                        startRecordingBtn.style.display = 'none';
+                        stopRecordingBtn.style.display = 'inline-flex';
+                        recordingIndicator.classList.add('active');
+                        showNotification('录像开始', 'success');
+                        
+                        recordingStartTime = Date.now();
+                        updateRecordingTime();
+                        recordingTimer = setInterval(updateRecordingTime, 1000);
+                    } else {
+                        showNotification(data.message || '无法开始录像', 'error');
+                    }
+                } catch (error) {
+                    console.error('开始录像失败:', error);
+                    showNotification('无法开始录像', 'error');
+                }
+            }
+            
+            async function stopRecording() {
+                try {
+                    const response = await fetch('/toggle_recording', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ action: 'stop' })
+                    });
+                    const data = await response.json();
+                    if (data.status === 'success') {
+                        isRecording = false;
+                        startRecordingBtn.style.display = 'inline-flex';
+                        stopRecordingBtn.style.display = 'none';
+                        recordingIndicator.classList.remove('active');
+                        showNotification('录像已保存', 'success');
+                        
+                        clearInterval(recordingTimer);
+                        
+                        if (recordingsList.style.display === 'block') {
+                            loadRecordings();
+                        }
+                    } else {
+                        showNotification(data.message || '无法停止录像', 'error');
+                    }
+                } catch (error) {
+                    console.error('停止录像失败:', error);
+                    showNotification('无法停止录像', 'error');
+                }
+            }
+            
+            async function startMotor() {
+                try {
+                    startMotorBtn.disabled = true;
+                    const response = await fetch('/control_motor', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ action: 'start', speed: motorSpeedSlider.value })
+                    });
+                    const data = await response.json();
+                    if (data.status === 'success') {
+                        isMotorRunning = true;
+                        startMotorBtn.style.display = 'none';
+                        stopMotorBtn.style.display = 'inline-flex';
+                        showNotification(data.message, 'success');
+                        await loadMotorStatus();
+                    } else {
+                        showNotification(data.message || '无法启动电机', 'error');
+                    }
+                } catch (error) {
+                    console.error('启动电机失败:', error);
+                    showNotification('无法启动电机', 'error');
+                } finally {
+                    startMotorBtn.disabled = false;
+                }
+            }
+            
+            async function stopMotor() {
+                try {
+                    stopMotorBtn.disabled = true;
+                    const response = await fetch('/control_motor', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ action: 'stop' })
+                    });
+                    const data = await response.json();
+                    if (data.status === 'success') {
+                        isMotorRunning = false;
+                        startMotorBtn.style.display = 'inline-flex';
+                        stopMotorBtn.style.display = 'none';
+                        showNotification(data.message, 'success');
+                        await loadMotorStatus();
+                    } else {
+                        showNotification(data.message || '无法停止电机', 'error');
+                    }
+                } catch (error) {
+                    console.error('停止电机失败:', error);
+                    showNotification('无法停止电机', 'error');
+                } finally {
+                    stopMotorBtn.disabled = false;
+                }
+            }
+            
+            async function updateMotorSpeed() {
+                if (isMotorRunning) {
+                    try {
+                        const response = await fetch('/control_motor', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ action: 'start', speed: motorSpeedSlider.value })
+                        });
+                        const data = await response.json();
+                        if (data.status === 'success') {
+                            showNotification(data.message, 'success');
+                            await loadMotorStatus();
+                        } else {
+                            showNotification(data.message || '无法更新电机速度', 'error');
+                        }
+                    } catch (error) {
+                        console.error('更新电机速度失败:', error);
+                        showNotification('无法更新电机速度', 'error');
+                    }
+                }
+            }
+            
+            function updateRecordingTime() {
+                const elapsed = Math.floor((Date.now() - recordingStartTime) / 1000);
+                const minutes = Math.floor(elapsed / 60).toString().padStart(2, '0');
+                const seconds = (elapsed % 60).toString().padStart(2, '0');
+                recordingIndicator.querySelector('span').textContent = `REC ${minutes}:${seconds}`;
+            }
+            
+            function toggleRecordingsList() {
+                if (recordingsList.style.display === 'block') {
+                    recordingsList.style.display = 'none';
+                } else {
+                    recordingsList.style.display = 'block';
+                    loadRecordings();
+                }
+            }
+            
+            async function loadRecordings() {
+                try {
+                    const response = await fetch('/get_recordings');
+                    const data = await response.json();
+                    if (data.recordings.length === 0) {
+                        recordingsContent.innerHTML = '<div class="recording-item">未找到录像</div>';
+                        return;
+                    }
+                    
+                    recordingsContent.innerHTML = '';
+                    data.recordings.forEach(recording => {
+                        const fileSize = formatFileSize(recording.size);
+                        const item = document.createElement('div');
+                        item.className = 'recording-item';
+                        item.innerHTML = `
+                            <div class="recording-info">
+                                <div class="recording-name">${recording.name}</div>
+                                <div class="recording-meta">
+                                    <span>${recording.date}</span>
+                                    <span>${fileSize}</span>
+                                </div>
+                            </div>
+                            <div class="recording-actions">
+                                <button class="recording-btn download-btn" title="下载" data-filename="${recording.name}">
+                                    <i class="fas fa-download"></i>
+                                </button>
+                                <button class="recording-btn delete-btn" title="删除" data-filename="${recording.name}">
+                                    <i class="fas fa-trash-alt"></i>
+                                </button>
+                            </div>
+                        `;
+                        recordingsContent.appendChild(item);
+                        
+                        item.querySelector('.download-btn').addEventListener('click', () => downloadRecording(recording.name));
+                        item.querySelector('.delete-btn').addEventListener('click', () => deleteRecording(recording.name));
+                    });
+                } catch (error) {
+                    console.error('加载录像失败:', error);
+                    recordingsContent.innerHTML = '<div class="recording-item">无法加载录像</div>';
+                }
+            }
+            
+            function downloadRecording(filename) {
+                const link = document.createElement('a');
+                link.href = `/download_recording/${encodeURIComponent(filename)}`;
+                link.download = filename;
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+            }
+            
+            async function deleteRecording(filename) {
+                if (confirm(`确定要删除 ${filename} 吗？`)) {
+                    try {
+                        const response = await fetch(`/delete_recording/${encodeURIComponent(filename)}`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' }
+                        });
+                        const data = await response.json();
+                        if (data.status === 'success') {
+                            showNotification('文件已删除', 'success');
+                            loadRecordings();
+                        } else {
+                            showNotification(data.message || '无法删除文件', 'error');
+                        }
+                    } catch (error) {
+                        console.error('删除文件失败:', error);
+                        showNotification('无法删除文件', 'error');
+                    }
+                }
+            }
+            
+            function formatFileSize(bytes) {
+                if (bytes === 0) return '0 Bytes';
+                const k = 1024;
+                const sizes = ['Bytes', 'KB', 'MB', 'GB'];
+                const i = Math.floor(Math.log(bytes) / Math.log(k));
+                return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+            }
+            
+            function showNotification(message, type = 'info') {
+                const notificationIcon = notification.querySelector('.notification-icon i');
+                const notificationMessage = notification.querySelector('.notification-message');
+                
+                notification.className = 'notification';
+                notification.classList.add(type);
+                
+                if (type === 'success') {
+                    notificationIcon.className = 'fas fa-check-circle';
+                } else if (type === 'error') {
+                    notificationIcon.className = 'fas fa-exclamation-circle';
+                } else {
+                    notificationIcon.className = 'fas fa-info-circle';
+                }
+                
+                notificationMessage.textContent = message;
+                notification.classList.add('show');
+                
+                setTimeout(() => {
+                    notification.classList.remove('show');
+                }, 3000);
+            }
+            
+            function toggleSidebar() {
+                sidebar.classList.toggle('show');
+            }
+            
+            async function takeSnapshot() {
+                try {
+                    const response = await fetch('/video_feed');
+                    const blob = await response.blob();
+                    const url = URL.createObjectURL(blob);
+                    const link = document.createElement('a');
+                    link.href = url;
+                    link.download = `snapshot_${new Date().toISOString().replace(/[:.]/g, '-')}.jpg`;
+                    document.body.appendChild(link);
+                    link.click();
+                    document.body.removeChild(link);
+                    URL.revokeObjectURL(url);
+                    showNotification('快照已保存', 'success');
+                } catch (error) {
+                    console.error('快照失败:', error);
+                    showNotification('无法保存快照', 'error');
+                }
+            }
+            
+            function toggleFullscreen() {
+                if (!document.fullscreenElement) {
+                    videoContainer.requestFullscreen().catch(err => {
+                        showNotification('全屏模式不支持', 'error');
+                    });
+                } else {
+                    document.exitFullscreen();
+                }
+            }
+            
+            document.addEventListener('fullscreenchange', () => {
+                if (document.fullscreenElement) {
+                    fullscreenBtn.querySelector('i').className = 'fas fa-compress';
+                } else {
+                    fullscreenBtn.querySelector('i').className = 'fas fa-expand';
+                }
+            });
+        </script>
+    </body>
+    </html>
+    """
+
+if __name__ == '__main__':
+    try:
+        initialize_camera()
+        initialize_gpio()
+        app.run(host='0.0.0.0', port=5000, threaded=True)
+    except Exception as e:
+        logger.error(f"应用启动失败: {str(e)}")
+    finally:
+        if camera is not None:
+            camera.release()
+        if output_file is not None:
+            output_file.release()
+        if h is not None:
+            try:
+                set_pwm(0)
+                lgpio.gpio_write(h, GPIO_PIN, 0)
+                lgpio.gpiochip_close(h)
+                logger.info("GPIO已清理")
+            except Exception as e:
+                logger.error(f"GPIO清理失败: {str(e)}")
