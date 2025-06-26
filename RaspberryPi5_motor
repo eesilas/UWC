@@ -1,0 +1,58 @@
+import lgpio
+import time
+import sys
+
+# GPIO配置
+GPIO_PIN = 18  # GPIO18/Pin12
+FREQUENCY = 50  # 50Hz
+PERIOD_MS = 1000 / FREQUENCY  # 20ms
+NEUTRAL_PULSE = 0.0015  # 1500μs (停止)
+FULL_CW_PULSE = 0.002   # 2000μs (全速CW)
+
+# 初始化GPIO
+try:
+    h = lgpio.gpiochip_open(0)
+    lgpio.gpio_claim_output(h, GPIO_PIN)
+except Exception as e:
+    print(f"GPIO初始化错误：{e}")
+    sys.exit(1)
+
+def set_pwm(state):
+    """
+    控制推进器状态
+    state: 0 (停止), 1 (顺时针全速)
+    """
+    try:
+        pulse_width = FULL_CW_PULSE if state == 1 else NEUTRAL_PULSE
+        for _ in range(100):  # 2秒循环
+            lgpio.gpio_write(h, GPIO_PIN, 1)
+            time.sleep(pulse_width)
+            lgpio.gpio_write(h, GPIO_PIN, 0)
+            time.sleep(PERIOD_MS / 1000 - pulse_width)
+        print(f"推进器{'顺时针全速运行' if state == 1 else '停止'}")
+    except Exception as e:
+        print(f"设置PWM错误：{e}")
+
+try:
+    print("初始化ESC，请等待2秒...")
+    set_pwm(0)  # 中立信号
+    time.sleep(2)
+
+    print("输入 '1' 启动顺时针旋转，'0' 停止，'q' 退出")
+    while True:
+        user_input = input("命令 (1=启动, 0=停止, q=退出): ")
+        if user_input.lower() == 'q':
+            set_pwm(0)
+            break
+        if user_input in ['0', '1']:
+            set_pwm(int(user_input))
+        else:
+            print("请输入 '1', '0' 或 'q'")
+except KeyboardInterrupt:
+    print("\n程序终止")
+finally:
+    print("清理GPIO...")
+    set_pwm(0)
+    lgpio.gpio_write(h, GPIO_PIN, 0)
+    lgpio.gpiochip_close(h)
+    print("GPIO已清理")
