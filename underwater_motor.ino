@@ -1,10 +1,10 @@
 #include <ESP32Servo.h>
 
-#define ESC_PIN 16 // ESC 信號引腳
+#define ESC_PIN 16 // ESC signal pin
 
 Servo esc;
-int stopPulse = 1500; // 停止點脈寬（可微調）
-int currentPulse = 1500; // 當前脈寬
+int stopPulse = 1500; // stop pulse which is adjustable 
+int currentPulse = 1500; // current pulse
 
 void setup() {
   // 初始化串口通信
