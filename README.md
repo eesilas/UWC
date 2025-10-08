@@ -13,6 +13,13 @@ FBV6 : forth and back vector
 FBV7 : forth and back vector
 UDV8 : up and down vector
 
+UP 1548
+DN 1548
+LEFT 1548
+RIGHT 1548
+FRONT 2367
+BACK  2367
+
 Rewrite the program code from 
 1. use Arduino ESP32 to use Arduino Mega 2560 Pro
 2. change to control 8 underwater thruster (motor) using an ESC (Electronic Speed Controller) connected to an Arduino Mega 2560 Pro microcontroller, originally is control 1 underwater thruster (motor) using an ESC (Electronic Speed Controller) connected microcontroller.
