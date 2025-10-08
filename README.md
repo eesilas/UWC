@@ -12,13 +12,13 @@ UDV5 : up and down vector
 FBV6 : forth and back vector
 FBV7 : forth and back vector
 UDV8 : up and down vector
-
-UP 1548 eg. (CW, CCW, CW, CCW)
-DN 1548 eg. (CW, CCW, CW, CCW)
-LEFT 1548 eg. (CW, CCW, CW, CCW)
-RIGHT 1548 eg. (CW, CCW, CW, CCW)
-FRONT 2367 eg. (CW, CCW, CW, CCW)
-BACK  2367 eg. (CW, CCW, CW, CCW)
+Movement UP DN LEFT RIGHT
+UP (1:CCW, 4:CCW, 5:CCW, 8:CCW)
+DN (1:CW, 4:CW, 5:CW,  8:CW)
+LEFT (1:CCW, 4:CW, 5:CW, 8:CCW)
+RIGHT (1:CW, 4:CCW, 5:CCW, 8:CW)
+FRONT (2:CW, 3:CCW, 6:CW, 7:CCW)
+BACK  (2:CW, 3:CCW, 6:CW, 7:CCW)
 
 Rewrite the program code from 
 1. use Arduino ESP32 to use Arduino Mega 2560 Pro
