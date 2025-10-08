@@ -21,13 +21,13 @@ BACK  (UR2:CW, LR3:CCW, UL6:CW, LL7:CCW)
 
 Operation
 Start:
-vertical move to top left 
+sub-carrier vertical move to top left 
 brush turn on
 Swip:
-move right 1.4 meter with speed:
-move down 0.2 meter with speed:
-move left 1.4 meter with speed:
-move down 0.2 meter with speed:
+sub-carrier move right 1.4 meter with speed:
+sub-carrier move down 0.2 meter with speed:
+sub-carrier move left 1.4 meter with speed:
+sub-carrier move down 0.2 meter with speed:
 if not count > 10 Goto Swip
 end swip 1th wall
 rotate CW to scan second wall
