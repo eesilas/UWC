@@ -2,23 +2,22 @@
 program name: underwater_motor.ino
 
 This program is designed to control an underwater thruster (motor) using an ESC (Electronic Speed Controller) connected to an ESP32 microcontroller. 
-
-Name of 8 Thrusters layout 
-UDV1 : up and down vector 
-FBV2 : forth and back vector
-FBV3 : forth and back vector
-UDV4 : up and down vector
-UDV5 : up and down vector
-FBV6 : forth and back vector
-FBV7 : forth and back vector
-UDV8 : up and down vector
-Movement UP DN LEFT RIGHT
-UP (1:CCW, 4:CCW, 5:CCW, 8:CCW)
-DN (1:CW, 4:CW, 5:CW,  8:CW)
-LEFT (1:CCW, 4:CW, 5:CW, 8:CCW)
-RIGHT (1:CW, 4:CCW, 5:CCW, 8:CW)
-FRONT (2:CW, 3:CCW, 6:CW, 7:CCW)
-BACK  (2:CW, 3:CCW, 6:CW, 7:CCW)
+There are 8 thruster motor and name of 8 Thrusters layout 
+TR1 : up and down vector 
+UR2 : forth and back vector
+LR3 : forth and back vector
+BR4 : up and down vector
+TL5 : up and down vector
+UL6 : forth and back vector
+LL7 : forth and back vector
+UL8 : up and down vector
+Movement UP DN LEFT RIGHT corresponding to rotation CW is clock wise, and CCW is counter clock wise
+UP (TR1:CCW, BR4:CCW, TL5:CCW, BL8:CCW)
+DN (TR1:CW, BR4:CW, TL5:CW,  BL8:CW)
+LEFT (TR1:CCW, BR4:CW, TL5:CW, BL8:CCW)
+RIGHT (TR1:CW, BR4:CCW, TL5:CCW, BL8:CW)
+FRONT (UR2:CW, LR3:CCW, UL6:CW, LL7:CCW)
+BACK  (UR2:CW, LR3:CCW, UL6:CW, LL7:CCW)
 
 Operation
 Start:
