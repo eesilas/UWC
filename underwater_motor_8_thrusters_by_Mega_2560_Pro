@@ -1,0 +1,151 @@
+#include <Servo.h>
+
+// Define ESC signal pins for all 8 thrusters
+#define ESC_PIN_1 2
+#define ESC_PIN_2 3
+#define ESC_PIN_3 4
+#define ESC_PIN_4 5
+#define ESC_PIN_5 6
+#define ESC_PIN_6 7
+#define ESC_PIN_7 8
+#define ESC_PIN_8 9
+
+Servo esc1, esc2, esc3, esc4, esc5, esc6, esc7, esc8;
+
+// Stop pulse which is adjustable (default 1500µs)
+int stopPulse = 1500;
+// Current pulses for each thruster
+int currentPulse[8] = {1500, 1500, 1500, 1500, 1500, 1500, 1500, 1500};
+
+void setup() {
+  // Initialize serial communication
+  Serial.begin(115200);
+  Serial.println("Arduino Mega 2560 Pro - 8 Thruster Control Initialized");
+
+  // Attach ESCs and set PWM range 1000 to 2000 µs
+  esc1.attach(ESC_PIN_1, 1000, 2000);
+  esc2.attach(ESC_PIN_2, 1000, 2000);
+  esc3.attach(ESC_PIN_3, 1000, 2000);
+  esc4.attach(ESC_PIN_4, 1000, 2000);
+  esc5.attach(ESC_PIN_5, 1000, 2000);
+  esc6.attach(ESC_PIN_6, 1000, 2000);
+  esc7.attach(ESC_PIN_7, 1000, 2000);
+  esc8.attach(ESC_PIN_8, 1000, 2000);
+
+  // Initialize all ESCs to stop
+  setAllThrusters(stopPulse);
+  delay(2000); // Wait for ESCs to initialize
+
+  Serial.println("Input format:");
+  Serial.println("  [thruster 1-8] [speed -100 to 100] - Control individual thruster");
+  Serial.println("  all [speed -100 to 100] - Control all thrusters");
+  Serial.println("  c - Calibrate stop point (1480-1520)");
+}
+
+void setAllThrusters(int pulse) {
+  esc1.writeMicroseconds(pulse);
+  esc2.writeMicroseconds(pulse);
+  esc3.writeMicroseconds(pulse);
+  esc4.writeMicroseconds(pulse);
+  esc5.writeMicroseconds(pulse);
+  esc6.writeMicroseconds(pulse);
+  esc7.writeMicroseconds(pulse);
+  esc8.writeMicroseconds(pulse);
+  
+  for (int i = 0; i < 8; i++) {
+    currentPulse[i] = pulse;
+  }
+}
+
+void smoothTransition(int thruster, int targetPulse) {
+  // Gradually adjust PWM to reduce vibration
+  while (currentPulse[thruster] != targetPulse) {
+    if (currentPulse[thruster] < targetPulse) {
+      currentPulse[thruster] += 10;
+      if (currentPulse[thruster] > targetPulse) currentPulse[thruster] = targetPulse;
+    } else {
+      currentPulse[thruster] -= 10;
+      if (currentPulse[thruster] < targetPulse) currentPulse[thruster] = targetPulse;
+    }
+    
+    // Update the specific thruster
+    switch(thruster) {
+      case 0: esc1.writeMicroseconds(currentPulse[thruster]); break;
+      case 1: esc2.writeMicroseconds(currentPulse[thruster]); break;
+      case 2: esc3.writeMicroseconds(currentPulse[thruster]); break;
+      case 3: esc4.writeMicroseconds(currentPulse[thruster]); break;
+      case 4: esc5.writeMicroseconds(currentPulse[thruster]); break;
+      case 5: esc6.writeMicroseconds(currentPulse[thruster]); break;
+      case 6: esc7.writeMicroseconds(currentPulse[thruster]); break;
+      case 7: esc8.writeMicroseconds(currentPulse[thruster]); break;
+    }
+    
+    delay(20); // Time between adjustments (20ms)
+  }
+}
+
+void loop() {
+  if (Serial.available() > 0) {
+    String input = Serial.readStringUntil('\n');
+    input.trim(); // Remove redundant spaces
+    
+    if (input.equalsIgnoreCase("c")) {
+      // Enter stop point calibration
+      Serial.println("Enter stop pulse (1480-1520):");
+      while (!Serial.available()) {}
+      String calibInput = Serial.readStringUntil('\n');
+      stopPulse = calibInput.toInt();
+      stopPulse = constrain(stopPulse, 1480, 1520); // Limit range
+      setAllThrusters(stopPulse);
+      Serial.print("Stop point set to: ");
+      Serial.println(stopPulse);
+    } 
+    else {
+      // Parse thruster number and speed
+      int spaceIndex = input.indexOf(' ');
+      if (spaceIndex != -1) {
+        String thrusterStr = input.substring(0, spaceIndex);
+        String speedStr = input.substring(spaceIndex + 1);
+        
+        int speed = speedStr.toInt();
+        speed = constrain(speed, -100, 100); // Speed range limit
+        
+        // Calculate target PWM value
+        int targetPulse;
+        if (speed == 0) {
+          targetPulse = stopPulse; // Use calibrated stop point
+        } else {
+          targetPulse = map(abs(speed), 0, 100, stopPulse, speed >= 0 ? 2000 : 1000);
+        }
+        
+        if (thrusterStr.equalsIgnoreCase("all")) {
+          // Control all thrusters
+          for (int i = 0; i < 8; i++) {
+            smoothTransition(i, targetPulse);
+          }
+          Serial.print("All thrusters set to speed: ");
+          Serial.print(speed);
+          Serial.print("%, PWM: ");
+          Serial.println(targetPulse);
+        } 
+        else {
+          // Control individual thruster
+          int thruster = thrusterStr.toInt() - 1; // Convert to 0-based index
+          if (thruster >= 0 && thruster < 8) {
+            smoothTransition(thruster, targetPulse);
+            Serial.print("Thruster ");
+            Serial.print(thruster + 1);
+            Serial.print(" set to speed: ");
+            Serial.print(speed);
+            Serial.print("%, PWM: ");
+            Serial.println(targetPulse);
+          } else {
+            Serial.println("Invalid thruster number (1-8)");
+          }
+        }
+      } else {
+        Serial.println("Invalid input format. Use '[thruster] [speed]' or 'all [speed]'");
+      }
+    }
+  }
+}
