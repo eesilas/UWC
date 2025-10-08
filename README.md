@@ -20,6 +20,19 @@ RIGHT (1:CW, 4:CCW, 5:CCW, 8:CW)
 FRONT (2:CW, 3:CCW, 6:CW, 7:CCW)
 BACK  (2:CW, 3:CCW, 6:CW, 7:CCW)
 
+Operation
+Start:
+vertical move to top left 
+brush turn on
+Swip:
+move right 1.4 meter with speed:
+move down 0.2 meter with speed:
+move left 1.4 meter with speed:
+move down 0.2 meter with speed:
+if not count > 10 Goto Swip
+end swip 1th wall
+rotate CW to scan second wall
+
 Rewrite the program code from 
 1. use Arduino ESP32 to use Arduino Mega 2560 Pro
 2. change to control 8 underwater thruster (motor) using an ESC (Electronic Speed Controller) connected to an Arduino Mega 2560 Pro microcontroller, originally is control 1 underwater thruster (motor) using an ESC (Electronic Speed Controller) connected microcontroller.
