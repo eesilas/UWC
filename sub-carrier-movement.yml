@@ -1,0 +1,46 @@
+# Sub-carrier Movement Configuration
+movement_sequence:
+  - name: "Start"
+    actions:
+      - type: "move"
+        direction: "vertical"
+        target: "top_left"
+      - type: "brush"
+        state: "on"
+
+  - name: "Swip"
+    actions:
+      - type: "move"
+        direction: "right"
+        distance: 1.4  # meters
+        speed: 0.5     # m/s (example speed, adjust as needed)
+      
+      - type: "move"
+        direction: "down"
+        distance: 0.2  # meters
+        speed: 0.3     # m/s
+      
+      - type: "move"
+        direction: "left"
+        distance: 1.4  # meters
+        speed: 0.5     # m/s
+      
+      - type: "move"
+        direction: "down"
+        distance: 0.2  # meters
+        speed: 0.3     # m/s
+    
+    loop:
+      condition: "count <= 10"
+      goto: "Swip"
+
+  - name: "End Swip 1st Wall"
+    note: "Completed 10 swipes on first wall"
+
+  - name: "Rotate for Second Wall"
+    actions:
+      - type: "rotate"
+        direction: "clockwise"
+        angle: 90      # degrees
+        speed: 10      # deg/s
+    note: "Prepare to scan second wall"
