@@ -4,7 +4,7 @@ import time
 
 # SocketIO客户端连接到RPi 5服务器
 sio = socketio.Client(reconnection=True, reconnection_attempts=5, reconnection_delay=1)  # 添加重连逻辑
-SERVER_URL = 'http://192.168.0.191:5000'  # 更新为您的RPi 5 IP和端口
+SERVER_URL = 'http://192.168.68.55:5000'  # 更新为您的RPi 5 IP和端口
 
 @sio.event(namespace='/')
 def connect():
