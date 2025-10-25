@@ -70,6 +70,29 @@ If a speed value is received, it calculates the corresponding PWM pulse and smoo
 If 'c' is received, it enters calibration mode for the stop pulse.
 It prints status updates to the serial monitor for user feedback.
 
+Forward Backward Left Right Up Down
+1    0     0     1     -1      -1     1
+2    0     0     1     -1       1     -1
+3     0    0     1     -1       1     -1
+4    0    0      -1     1       1     -1
+5    -1    1     -0.2   -0.2    0      0
+6    -1    1     -0.2   -0.2    0      0
+7     1    -1     0.2    0.2    0      0
+8     1    -1     0.2    0.2    0      0
+
+thurster signal from 1900 to 1100, where 1900 is CW and 1100 is CCW, where the middle is 1500 stop
+
+Router card Deco, SIM card CLS number 64494166
+Hand handler       shift 
+                                 up, spin
+RPi 192.168.68.57
+Router 192.168.68.1 (default by distribute 50 to 250)
+Laptop (red computer) 192.168.68.50
+User\cloud led\python client.py
+
+                                 
+
+
 In summary:
 This program allows you to control an underwater motor's speed and direction through an ESC using simple serial commands. It supports forward/reverse motion, includes a calibration mode for precise stopping, and implements smooth speed transitions for safer motor operation.
 
