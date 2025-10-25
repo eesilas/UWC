@@ -70,7 +70,8 @@ If a speed value is received, it calculates the corresponding PWM pulse and smoo
 If 'c' is received, it enters calibration mode for the stop pulse.
 It prints status updates to the serial monitor for user feedback.
 
-Forward Backward Left Right Up Down
+Table corresponding motor number(left col) and 8 thruster rotation and speed (top row):
+Motor Forward Backward Left Right Up Down
 1    0     0     1     -1      -1     1;
 2    0     0     1     -1       1     -1;
 3     0    0     1     -1       1     -1;
