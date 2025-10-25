@@ -90,6 +90,18 @@ Router 192.168.68.1 (default by distribute 50 to 250)
 Laptop (red computer) 192.168.68.50
 User\cloud led\python client.py
 
+Use Android phone to Deco icon, it could fix IP and confirm IP to particular value 
+
+Use PowerShell > ssh 192.168.68.57
+
+Procedures to run demo of sub-carrier:
+AP 4G card HK with Deco router green lite up
+Acer Nitro computer (red computer) with USB mouse
+Browser 192.168.68.57:8080
+browser display control panel 192.168.68.57:5000 (control panel)
+Yellow cable roll to router: router one to yellow cable roll and router one to Acer nitro PC with 2 RJ45 cable
+Sub-carrier's RPi is turn on 
+
                                  
 
 
