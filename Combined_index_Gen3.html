@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>水下機器人綜合控制面板</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script>
+    <script src="https://code.jquery.com/jquery-3.6.0.min.js"></script>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 0; padding: 10px; background: linear-gradient(to bottom, #e0f7fa, #f0f0f0); }
+        .container { 
+            display: grid; 
+            grid-template-rows: auto auto 1fr auto;  /* 行1: 視窗, 行2: 其他小區塊, 行3: TAM 大區塊, 行4: 空白或額外 */
+            grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); 
+            gap: 15px; max-width: 1400px; margin: auto; 
+        }
+        .video-section { grid-row: 1; grid-column: 1 / -1; }  /* 視窗獨佔第一行全寬 */
+        .small-section { grid-row: 2; }  /* 其他小區塊齊排第二行 */
+        .tam-section { grid-row: 3; grid-column: 1 / -1; }  /* TAM 獨佔第三行全寬大區塊 */
+        .section { border: 1px solid #ddd; padding: 15px; background: white; border-radius: 12px; box-shadow: 0 4px 12px rgba(0,0,0,0.1); }
+        .tam-section { padding: 20px; }  /* TAM 區塊額外放大內邊距 */
+        h2 { font-size: 18px; margin: 0 0 10px 0; color: #00796b; border-bottom: 2px solid #00796b; padding-bottom: 5px; }
+        .item, .motor { margin: 8px 0; font-size: 14px; }  /* 小區塊內容緊湊 */
+        .val { font-weight: bold; color: #00796b; font-size: 16px; }
+        .no-data { color: #999; font-style: italic; }
+        table { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 10px; }  /* TAM 字體不變 */
+        table th, table td { border: 1px solid #ddd; padding: 20px 8px; text-align: center; }  /* TAM 行高增加 (20px padding) */
+        table th { background: #f5f5f5; }
+        input[type="submit"], button { width: 100%; padding: 10px; margin-top: 10px; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; transition: background 0.3s; }  /* 按鈕緊湊 */
+        input[type="submit"] { background: #4caf50; color: white; }
+        input[type="submit"]:hover { background: #45a049; }
+        button { background: #2196f3; color: white; margin: 5px 0; font-size: 14px; }  /* 按鈕緊湊 */
+        button:hover { background: #1976d2; }
+        button.on { background: #f44336; }
+        button.off { background: #4caf50; }
+        .switch-pressed { color: #f44336; font-weight: bold; }
+        input[type="range"] { width: 100%; margin: 5px 0; }
+        select { width: 100%; padding: 6px; margin: 5px 0; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; }  /* 選單緊湊 */
+        .status { font-size: 12px; color: #666; }  /* 狀態文字緊湊 */
+        .auto-status { background: #fff3cd; padding: 8px; border-radius: 6px; margin: 10px 0; text-align: center; font-weight: bold; font-size: 14px; }  /* 狀態區塊緊湊 */
+        #camera-section { text-align: center; padding: 20px; }  /* 視窗區塊額外放大內邊距 */
+        #stream-img { width: 100%; max-width: 100%; height: auto; border: 2px solid #ddd; border-radius: 8px; box-shadow: 0 4px 12px rgba(0,0,0,0.2); }  /* 視窗全寬放大 */
+        #ip-input { width: 80%; padding: 8px; margin: 5px; border: 1px solid #ddd; border-radius: 4px; font-size: 14px; }
+        #record-btn { background: #ff9800; color: white; width: auto; padding: 10px 20px; margin: 5px; font-size: 14px; }
+        #record-btn.recording { background: #f44336; }
+        .small-section { height: auto; min-height: 120px; }  /* 其他小區塊縮小高度 */
+    </style>
+    <script>
+        var socket = io();
+        var mediaRecorder = null;
+        var recordedChunks = [];
+        var recordInterval = null;
+        var streamVideo = null;
+
+        socket.on('update_pwms', function(pwms) {
+            for (var i = 0; i < 8; i++) {
+                $('#pwm' + (i+1)).text(pwms[i]);
+            }
+        });
+        socket.on('update_switches', function(states) {
+            $('#switch1').text(states[0]).toggleClass('switch-pressed', states[0] === 1);
+            $('#switch2').text(states[1]).toggleClass('switch-pressed', states[1] === 1);
+        });
+        socket.on('update_sensors', function(distances) {
+            if (distances[0] !== null) $('#sensor1').text(distances[0].toFixed(1) + ' cm');
+            if (distances[1] !== null) $('#sensor2').text(distances[1].toFixed(1) + ' cm');
+            if (distances[2] !== null) $('#sensor3').text(distances[2].toFixed(1) + ' cm');
+        });
+        socket.on('update_accel', function(accel) {
+            $('#accelX').text(accel[0].toFixed(2));
+            $('#accelY').text(accel[1].toFixed(2));
+            $('#accelZ').text(accel[2].toFixed(2));
+        });
+        socket.on('update_quat_angles', function(data) {
+            $('#quatI').text(data.quat_i.toFixed(2));
+            $('#yaw').text(data.angles[0].toFixed(2));
+            $('#pitch').text(data.angles[1].toFixed(2));
+            $('#roll').text(data.angles[2].toFixed(2));
+        });
+
+        // 防抖動
+        function debounce(fn, delay) {
+            var timer = null;
+            return function() {
+                var context = this, args = arguments;
+                clearTimeout(timer);
+                timer = setTimeout(function() {
+                    fn.apply(context, args);
+                }, delay);
+            };
+        }
+
+        // 電機控制
+        function controlMotor(motor) {
+            var direction = $('#direction_' + motor).val();
+            var speed = $('#speed_' + motor).val();
+            $('#status_' + motor).text('當前: ' + direction + ' at ' + speed);
+            $.post('/control', { motor: motor, direction: direction, speed: speed });
+        }
+
+        // 繼電器控制
+        function toggleRelay(relay) {
+            var on = !$('#relay' + relay).hasClass('on');
+            $.post('/relay', { relay: relay, state: on ? 'ON' : 'OFF' });
+            $('#relay' + relay).toggleClass('on', on).text(on ? '關閉' : '開啟');
+        }
+
+        // NeoPixel 控制
+        function toggleNeo() {
+            var on = !$('#neo').hasClass('on');
+            $.post('/neo', { state: on ? 'ON' : 'OFF' });
+            $('#neo').toggleClass('on', on).text(on ? '關閉' : '開啟');
+        }
+
+        // 為滑桿添加防抖動
+        var debouncedControl = {};
+        for (var m = 1; m <= 4; m++) {
+            debouncedControl[m] = debounce(controlMotor, 200);
+        }
+
+        // 相機串流控制
+        function refreshStream() {
+            var ip = $('#ip-input').val() || 'localhost';
+            var streamUrl = 'http://' + ip + ':8080/?action=stream';
+            $('#stream-img').attr('src', streamUrl + '&_t=' + new Date().getTime()).show();
+        }
+
+        function toggleRecording() {
+            var btn = $('#record-btn');
+            if (btn.hasClass('recording')) {
+                stopRecording();
+            } else {
+                startRecording();
+            }
+        }
+
+        function startRecording() {
+            var ip = $('#ip-input').val() || 'localhost';
+            var streamUrl = 'http://' + ip + ':8080/?action=stream';
+            var video = document.createElement('video');
+            video.src = streamUrl;
+            video.muted = true;
+            video.play();
+
+            var canvas = document.createElement('canvas');
+            var ctx = canvas.getContext('2d');
+            canvas.width = 640;
+            canvas.height = 480;
+
+            mediaRecorder = new MediaRecorder(canvas.captureStream(30));
+            recordedChunks = [];
+
+            mediaRecorder.ondataavailable = function(e) {
+                if (e.data.size > 0) recordedChunks.push(e.data);
+            };
+
+            mediaRecorder.onstop = function() {
+                var blob = new Blob(recordedChunks, { type: 'video/webm' });
+                var url = URL.createObjectURL(blob);
+                var a = document.createElement('a');
+                a.href = url;
+                a.download = 'recording_' + new Date().toISOString().slice(0, 19).replace(/:/g, '-') + '.webm';
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+                recordedChunks = [];
+            };
+
+            mediaRecorder.start();
+            $('#record-btn').text('停止錄影').addClass('recording');
+            recordInterval = setInterval(function() {
+                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            }, 33);  // ~30 FPS
+        }
+
+        function stopRecording() {
+            if (mediaRecorder) {
+                mediaRecorder.stop();
+                clearInterval(recordInterval);
+                $('#record-btn').text('開始錄影').removeClass('recording');
+            }
+        }
+
+        // 頁面載入時預設刷新串流
+        $(document).ready(function() {
+            refreshStream();
+        });
+    </script>
+</head>
+<body>
+    <div class="container">
+        <!-- 相機串流視窗 (放大，全寬) -->
+        <div class="section video-section" id="camera-section">
+            <h2>相機串流視窗</h2>
+            <div style="display: flex; align-items: center; margin-bottom: 10px;">
+                <input type="text" id="ip-input" placeholder="輸入 RPi5 IP (e.g., 192.168.68.57)" value="localhost">
+                <button onclick="refreshStream()">刷新串流</button>
+            </div>
+            <div style="text-align: center; margin-bottom: 10px;">
+                <img id="stream-img" src="" alt="相機串流" style="display: none;">
+            </div>
+            <div style="text-align: center;">
+                <button id="record-btn" onclick="toggleRecording()">開始錄影</button>
+            </div>
+        </div>
+
+        <!-- 其他小區塊齊排一行 (縮小) -->
+        <div class="section small-section">
+            <h2>超聲波距離感測器</h2>
+            <div class="sensor-item">感測器 1 (左): <span id="sensor1" class="no-data">載入中…</span></div>
+            <div class="sensor-item">感測器 2 (底): <span id="sensor2" class="no-data">載入中…</span></div>
+            <div class="sensor-item">感測器 3 (右): <span id="sensor3" class="no-data">載入中…</span></div>
+        </div>
+
+        <div class="section small-section">
+            <h2>IMU 數據</h2>
+            <div class="imu-item">加速度 X: <span id="accelX" class="val">0.00</span> m/s²</div>
+            <div class="imu-item">加速度 Y: <span id="accelY" class="val">0.00</span> m/s²</div>
+            <div class="imu-item">加速度 Z: <span id="accelZ" class="val">0.00</span> m/s²</div>
+            <div class="imu-item">四元數 i: <span id="quatI" class="val">0.00</span></div>
+            <div class="imu-item">角度 Yaw: <span id="yaw" class="val">0.00</span> °</div>
+            <div class="imu-item">角度 Pitch: <span id="pitch" class="val">0.00</span> °</div>
+            <div class="imu-item">角度 Roll: <span id="roll" class="val">0.00</span> °</div>
+        </div>
+
+        <div class="section small-section">
+            <h2>電機控制</h2>
+            {% for m in range(1, 5) %}
+            <div class="motor">
+                <label>電機 {{ m }}</label>
+                <select id="direction_{{ m }}" onchange="controlMotor({{ m }})">
+                    <option value="CW">順時針</option>
+                    <option value="CCW">逆時針</option>
+                    <option value="STOP">停止</option>
+                </select>
+                <input type="range" id="speed_{{ m }}" min="0" max="255" value="0" oninput="debouncedControl[{{ m }}]({{ m }})">
+                <p class="status" id="status_{{ m }}">當前: STOP at 0</p>
+            </div>
+            {% endfor %}
+        </div>
+
+        <div class="section small-section">
+            <h2>推進器 PWM 值</h2>
+            <ul style="columns: 2; padding: 0;">
+                {% for i in range(1, 9) %}
+                <li>推進器 {{ i }}: <span id="pwm{{ i }}">{{ pwms[i-1] }}</span></li>
+                {% endfor %}
+            </ul>
+        </div>
+
+        <div class="section small-section">
+            <h2>開關狀態</h2>
+            <ul>
+                <li>左開關: <span id="switch1">0</span></li>
+                <li>右開關: <span id="switch2">0</span></li>
+            </ul>
+        </div>
+
+        <div class="section small-section">
+            <h2>繼電器控制</h2>
+            <div style="margin:10px 0">
+                <label>繼電器 1</label>
+                <button id="relay1" onclick="toggleRelay(1)">開啟</button>
+            </div>
+            <div style="margin:10px 0">
+                <label>繼電器 2</label>
+                <button id="relay2" onclick="toggleRelay(2)">開啟</button>
+            </div>
+            <div style="margin:10px 0">
+                <label>繼電器 3</label>
+                <button id="relay3" onclick="toggleRelay(3)">開啟</button>
+            </div>
+        </div>
+
+        <div class="section small-section">
+            <h2>環形燈控制</h2>
+            <button id="neo" onclick="toggleNeo()">開啟</button>
+        </div>
+
+        <!-- TAM 配置 (獨佔一大行，放大間距) -->
+        <div class="section tam-section">
+            <h2>TAM 配置</h2>
+            <form action="/update_tam" method="POST">
+                <table>
+                    <tr><th>推進器</th><th>前</th><th>後</th><th>左</th><th>右</th><th>上</th><th>下</th><th>yaw左</th><th>yaw右</th></tr>
+                    {% for i in range(8) %}
+                    <tr><td>{{ i+1 }}</td>
+                        {% for j in range(8) %}
+                        <td><input type="number" step="0.01" name="tam_{{ i }}_{{ j }}" value="{{ tam[i
