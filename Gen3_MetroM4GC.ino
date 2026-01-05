@@ -12,9 +12,9 @@ const int relayPin2 = 31;
 const int relayPin3 = 32;
 
 // Laser switch pins (LOW level trigger)
-const int laserPin1 = 45;
-const int laserPin2 = 52;
-const int laserPin3 = 53;
+const int laserPin1 = 40;
+const int laserPin2 = 41;
+const int laserPin3 = 42;
 
 // Leak sensor pin (HIGH level trigger)
 const int leakPin = 44;
